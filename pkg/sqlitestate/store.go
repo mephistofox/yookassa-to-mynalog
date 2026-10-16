@@ -128,7 +128,7 @@ func (s *Store) Get(kind, id string, out any) (bool, error) {
 	return true, json.Unmarshal([]byte(payload), out)
 }
 func (s *Store) List(kind string) ([]json.RawMessage, error) {
-	rows, err := s.db.Query("SELECT payload FROM records WHERE kind=? ORDER BY id", kind)
+	rows, err := s.db.Query("SELECT payload FROM records WHERE kind=? AND phase NOT IN ('done','sent','superseded') ORDER BY id", kind)
 	if err != nil {
 		return nil, err
 	}

@@ -25,6 +25,8 @@ type Store interface {
 	Meta(string) (string, error)
 	SetMeta(string, string) error
 	Get(kind, id string, out any) (bool, error)
+	// List returns open workflows only (exclude done, sent and superseded).
+	// Completed records must remain available through Get for deduplication.
 	List(kind string) ([]json.RawMessage, error)
 	Save(...Record) error
 	Counts() (map[string]int, error)
