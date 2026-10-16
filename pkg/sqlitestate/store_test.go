@@ -1,7 +1,8 @@
-package receipts
+package sqlitestate
 
 import (
 	"context"
+	"github.com/mephistofox/yookassa-to-mynalog/pkg/receipts"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,12 +10,12 @@ import (
 
 func TestStoreLockAndConsistentBackup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	s, err := OpenStore(path, true)
+	s, err := Open(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if other, err := OpenStore(path, true); err == nil {
+	if other, err := Open(path, true); err == nil {
 		other.Close()
 		t.Fatal("second writer acquired state")
 	}
@@ -23,7 +24,7 @@ func TestStoreLockAndConsistentBackup(t *testing.T) {
 	if err = s.Save(paymentRecord(&p), deliveryRecord(&d)); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := OpenStore(path, false)
+	reader, err := Open(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +33,7 @@ func TestStoreLockAndConsistentBackup(t *testing.T) {
 	if err = reader.Backup(context.Background(), backup); err != nil {
 		t.Fatal(err)
 	}
-	b, err := OpenStore(backup, false)
+	b, err := Open(backup, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestStoreRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
-	if s, err := OpenStore(path, true); err == nil {
+	if s, err := Open(path, true); err == nil {
 		s.Close()
 		t.Fatal("followed state symlink")
 	}
@@ -80,7 +81,7 @@ func TestExactMoney(t *testing.T) {
 
 func TestPythonStateCannotBeUsedAsGoState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "python-state.db")
-	s, err := OpenStore(path, true)
+	s, err := Open(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,8 +89,20 @@ func TestPythonStateCannotBeUsedAsGoState(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close()
-	if next, err := OpenStore(path, true); err == nil {
+	if next, err := Open(path, true); err == nil {
 		next.Close()
 		t.Fatal("Python state was silently reused without deduplication migration")
 	}
+}
+
+type PaymentJob = receipts.PaymentJob
+type Delivery = receipts.Delivery
+
+var ParseMoney = receipts.ParseMoney
+
+func paymentRecord(p *PaymentJob) Record {
+	return Record{Kind: "payment", ID: p.ID, Phase: p.Phase, Value: p}
+}
+func deliveryRecord(d *Delivery) Record {
+	return Record{Kind: "delivery", ID: d.ID, Phase: d.Phase, Value: d}
 }

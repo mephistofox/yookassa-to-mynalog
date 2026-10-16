@@ -1,5 +1,5 @@
 // Copyright 2026 fxTunnel contributors. Licensed under Apache-2.0.
-package receipts
+package sqlitestate
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mephistofox/yookassa-to-mynalog/pkg/state"
 )
 
 type Store struct {
@@ -20,12 +21,9 @@ type Store struct {
 	lock *os.File
 	path string
 }
-type Record struct {
-	Kind, ID, Phase string
-	Value           any
-}
+type Record = state.Record
 
-func OpenStore(path string, writable bool) (*Store, error) {
+func Open(path string, writable bool) (*Store, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -145,21 +143,6 @@ func (s *Store) List(kind string) ([]json.RawMessage, error) {
 	}
 	return result, rows.Err()
 }
-func listAs[T any](s *Store, kind string) ([]T, error) {
-	rows, err := s.List(kind)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]T, 0, len(rows))
-	for _, b := range rows {
-		var v T
-		if err = json.Unmarshal(b, &v); err != nil {
-			return nil, err
-		}
-		result = append(result, v)
-	}
-	return result, nil
-}
 
 // Save atomically commits domain state and its delivery outbox entry.
 func (s *Store) Save(records ...Record) error {
@@ -179,10 +162,6 @@ func (s *Store) Save(records ...Record) error {
 	}
 	return tx.Commit()
 }
-func paymentRecord(p *PaymentJob) Record { return Record{"payment", p.ID, p.Phase, p} }
-func refundRecord(r *RefundJob) Record   { return Record{"refund", r.ID, r.Phase, r} }
-func deliveryRecord(d *Delivery) Record  { return Record{"delivery", d.ID, d.Phase, d} }
-
 func (s *Store) Counts() (map[string]int, error) {
 	rows, err := s.db.Query("SELECT kind,phase,count(*) FROM records GROUP BY kind,phase ORDER BY kind,phase")
 	if err != nil {
@@ -219,14 +198,7 @@ func (s *Store) Backup(ctx context.Context, destination string) error {
 	return os.Chmod(abs, 0600)
 }
 
-type PendingJob struct {
-	Kind     string `json:"kind"`
-	ID       string `json:"id"`
-	Phase    string `json:"phase"`
-	Attempts int    `json:"attempts"`
-	Next     string `json:"next,omitempty"`
-	Error    string `json:"error,omitempty"`
-}
+type PendingJob = state.PendingJob
 
 // Pending returns operator diagnostics without customer contacts or secrets.
 func (s *Store) Pending() ([]PendingJob, error) {

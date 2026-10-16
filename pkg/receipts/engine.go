@@ -28,7 +28,7 @@ type Sender interface {
 }
 type Engine struct {
 	Config Config
-	Store  *Store
+	Store  StateStore
 	Source PaymentSource
 	Tax    TaxService
 	Sender Sender

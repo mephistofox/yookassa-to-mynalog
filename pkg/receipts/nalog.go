@@ -19,7 +19,7 @@ type Nalog struct {
 	client         *http.Client
 	base           string
 	config         Config
-	store          *Store
+	store          StateStore
 	token, refresh string
 	authNext       time.Time
 	lastRequest    time.Time
@@ -27,7 +27,7 @@ type Nalog struct {
 type tokenState struct{ Device, SeedHash, Token string }
 
 func seedHash(s string) string { b := sha256.Sum256([]byte(s)); return hex.EncodeToString(b[:]) }
-func NewNalog(c Config, s *Store) (*Nalog, error) {
+func NewNalog(c Config, s StateStore) (*Nalog, error) {
 	n := &Nalog{client: newHTTPClient(c.RequestTimeout, c.NalogSourceIP), base: "https://lknpd.nalog.ru/api/v1", config: c, store: s, refresh: c.RefreshToken}
 	v, err := s.Meta("auth.refresh")
 	if err != nil {

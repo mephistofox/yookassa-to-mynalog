@@ -15,7 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mephistofox/yookassa-to-mynalog/internal/receipts"
+	"github.com/mephistofox/yookassa-to-mynalog/pkg/receipts"
+	"github.com/mephistofox/yookassa-to-mynalog/pkg/sqlitestate"
 )
 
 var version = "dev"
@@ -70,7 +71,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if command == "status" || command == "backup" {
-		s, err := receipts.OpenStore(*dbPath, false)
+		s, err := sqlitestate.Open(*dbPath, false)
 		if err != nil {
 			return err
 		}
@@ -113,7 +114,7 @@ func run() error {
 			c.DBPath = *dbPath
 		}
 	})
-	s, err := receipts.OpenStore(c.DBPath, true)
+	s, err := sqlitestate.Open(c.DBPath, true)
 	if err != nil {
 		return err
 	}
