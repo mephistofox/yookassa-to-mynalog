@@ -1,34 +1,29 @@
+# fxTunnel Go port. Use a fresh named volume, never the Python state volume.
 services:
-  yookassa-to-mynalog:
-    container_name: yookassa-to-mynalog
-    hostname: yookassa-to-mynalog
-    image: grandvan/yookassa-to-mynalog:latest
+  receipts:
+    build: .
+    image: fxtunnel-receipts:local
     restart: unless-stopped
     init: true
-    env_file:
-      - .env
-    dns:
-      - 77.88.8.8
-      - 77.88.8.1
-    volumes:
-      - type: bind
-        source: ./data
-        target: /app/data
-      - type: bind
-        source: ./logs
-        target: /app/logs
+    env_file: .env
     environment:
-      PYTHONUNBUFFERED: "1"
-      DATA_DIR: /app/data
-      LOG_DIR: /app/logs
-    healthcheck:
-      test: ["CMD", "runuser", "-u", "app", "--", "python", "/app/healthcheck.py"]
-      interval: 1m
-      timeout: 15s
-      retries: 3
-      start_period: 5m
+      STATE_DB: /data/receipts-go.db
+      HEALTH_LISTEN: 0.0.0.0:8099
+    volumes:
+      - receipts-go:/data
+    ports:
+      - "127.0.0.1:8099:8099"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 40s
     logging:
-      driver: local
+      driver: json-file
       options:
-        max-size: "10m"
+        max-size: 10m
         max-file: "3"
+volumes:
+  receipts-go:

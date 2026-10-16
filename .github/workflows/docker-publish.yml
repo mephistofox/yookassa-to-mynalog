@@ -9,6 +9,8 @@ on:
 
 jobs:
   build-and-push:
+    # fxTunnel fork: the original publishing job must not target upstream images.
+    if: github.repository == 'grandvan709/yookassa-to-mynalog'
     runs-on: ubuntu-latest
     permissions:
       contents: read

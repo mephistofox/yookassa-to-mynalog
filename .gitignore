@@ -22,3 +22,13 @@ data/
 .claude/
 CLAUDE.md
 docs/superpowers/
+
+# fxTunnel Go runtime: never commit state, backups, secrets, or binaries.
+/bin/
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+.env.*
+!.env.example
+!.env.python.example

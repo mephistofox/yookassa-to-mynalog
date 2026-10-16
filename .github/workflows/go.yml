@@ -1,0 +1,23 @@
+name: Go port
+on:
+  push:
+    branches: [master, feat/go-fxtunnel]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build -trimpath -o bin/receipts ./cmd/receipts
+      - name: Build runtime image
+        run: docker build -t fxtunnel-receipts:test .
+      - name: Smoke runtime without external network
+        run: python3 scripts/smoke-go-container.py
