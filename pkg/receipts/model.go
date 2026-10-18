@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/mail"
 	"strconv"
 	"strings"
@@ -126,14 +127,35 @@ func (i Income) Cancelled() bool {
 	return s != "" && s != "null" && s != "false" && s != "{}"
 }
 func (i Income) Money() (Money, error) {
-	s := strings.Trim(string(i.Total), "\"")
-	// FNS may serialize numeric totals as 100 or 100.1.
-	if !strings.Contains(s, ".") {
-		s += ".00"
-	} else if len(strings.Split(s, ".")[1]) == 1 {
-		s += "0"
+	s := strings.TrimSpace(string(i.Total))
+	invalid := errors.New("invalid FNS amount")
+	if len(s) == 0 || len(s) > 128 {
+		return 0, invalid
 	}
-	return ParseMoney(s)
+	if s[0] == '"' {
+		if err := json.Unmarshal([]byte(s), &s); err != nil {
+			return 0, invalid
+		}
+	}
+	if len(s) == 0 || len(s) > 64 || s[0] < '0' || s[0] > '9' || !json.Valid([]byte(s)) {
+		return 0, invalid
+	}
+	// FNS returns scientific notation; bound its exponent before exact rational parsing.
+	if pos := strings.IndexAny(s, "eE"); pos >= 0 {
+		exponent, err := strconv.Atoi(s[pos+1:])
+		if err != nil || exponent < -20 || exponent > 20 {
+			return 0, invalid
+		}
+	}
+	amount, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return 0, invalid
+	}
+	amount.Mul(amount, big.NewRat(100, 1))
+	if !amount.IsInt() || !amount.Num().IsInt64() {
+		return 0, invalid
+	}
+	return ParseMoney(Money(amount.Num().Int64()).String())
 }
 
 // APIError intentionally never exposes a remote response body or credentials.
