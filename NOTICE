@@ -1,0 +1,13 @@
+yookassa-to-mynalog — fxTunnel Go port
+
+Based on https://github.com/grandvan709/yookassa-to-mynalog
+Upstream revision: f9f72fdad6e6cac242a52f50c1cdb93b71d24daa
+Original project and its contributors retain their copyright.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+The Go implementation, SMTP delivery, durable SQLite workflow, operational
+commands, tests, container and documentation were added by fxTunnel contributors
+in 2026. API payloads and workflow concepts were adapted from app/nalog_api.py
+and app/main.py. This fork changes the default runtime from Python to Go.
+The original Python source and configuration examples are retained for reference;
+see README.python.md, Dockerfile.python and docker-compose.python.yml.
