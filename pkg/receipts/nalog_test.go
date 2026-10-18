@@ -121,7 +121,7 @@ func TestNalogReauthOnceOn401(t *testing.T) {
 	n, _, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/auth/token" {
 			auths++
-			writeJSON(w, map[string]string{"token": "fresh"})
+			writeJSON(w, map[string]any{"token": "fresh", "profile": map[string]string{"inn": "123456789012"}})
 			return
 		}
 		posts++
@@ -163,7 +163,7 @@ func TestNalogFindPaginatesAndExcludesCancelled(t *testing.T) {
 				content = append(content, map[string]any{"approvedReceiptUuid": fmt.Sprint(i), "name": "target", "totalAmount": "10.10", "cancellationInfo": map[string]string{"reason": "refund"}})
 			}
 		} else {
-			content = []map[string]any{{"approvedReceiptUuid": "found", "name": "target", "totalAmount": json.Number("10.10")}}
+			content = []map[string]any{{"approvedReceiptUuid": "found", "name": "target", "totalAmount": json.Number("10.10"), "operationTime": time.Now().UTC().Format(time.RFC3339)}}
 		}
 		writeJSON(w, map[string]any{"content": content})
 	})
@@ -183,7 +183,7 @@ func TestNalogRepeatedPageAndMissingContentAreErrors(t *testing.T) {
 				}
 				items := make([]map[string]string, 50)
 				for i := range items {
-					items[i] = map[string]string{"approvedReceiptUuid": fmt.Sprint(i), "name": "other", "totalAmount": "1.00"}
+					items[i] = map[string]string{"approvedReceiptUuid": fmt.Sprint(i), "name": "other", "totalAmount": "1.00", "operationTime": time.Now().UTC().Format(time.RFC3339)}
 				}
 				writeJSON(w, map[string]any{"content": items})
 			})
@@ -200,7 +200,7 @@ func TestNalogRejectsDuplicateMatchesAndWrongAccount(t *testing.T) {
 			writeJSON(w, map[string]any{"token": "access", "profile": map[string]string{"inn": "999999999999"}})
 			return
 		}
-		writeJSON(w, map[string]any{"content": []map[string]string{{"approvedReceiptUuid": "a", "name": "target", "totalAmount": "1.00"}, {"approvedReceiptUuid": "b", "name": "target", "totalAmount": "1.00"}}})
+		writeJSON(w, map[string]any{"content": []map[string]string{{"approvedReceiptUuid": "a", "name": "target", "totalAmount": "1.00", "operationTime": time.Now().UTC().Format(time.RFC3339)}, {"approvedReceiptUuid": "b", "name": "target", "totalAmount": "1.00", "operationTime": time.Now().UTC().Format(time.RFC3339)}}})
 	})
 	if err := n.Authenticate(context.Background()); err == nil {
 		t.Fatal("wrong taxpayer account accepted")
@@ -225,5 +225,76 @@ func TestNalogLostConnectionAfterWriteIsUncertain(t *testing.T) {
 	var api *APIError
 	if !errors.As(err, &api) || !api.Uncertain {
 		t.Fatal("lost connection treated as safe to repeat")
+	}
+}
+func TestNalogReceiptVerifiesExplicitUUIDAmountDayAndTitle(t *testing.T) {
+	date := time.Date(2026, 10, 17, 22, 30, 0, 0, time.UTC)
+	for _, mode := range []string{"active", "cancelled", "missing", "amount", "day", "name", "duplicate"} {
+		t.Run(mode, func(t *testing.T) {
+			row := map[string]any{"approvedReceiptUuid": "chosen", "name": "Manual receipt title", "totalAmount": "10.00", "operationTime": "2026-10-18T01:30:00+03:00"}
+			switch mode {
+			case "cancelled":
+				row["cancellationInfo"] = map[string]string{"reason": "refund"}
+			case "missing":
+				row["approvedReceiptUuid"] = "other"
+			case "amount":
+				row["totalAmount"] = "10.01"
+			case "day":
+				row["operationTime"] = "2026-10-17T23:59:00+03:00"
+			case "name":
+				row["name"] = ""
+			}
+			rows := []map[string]any{row}
+			if mode == "duplicate" {
+				rows = append(rows, row)
+			}
+			n, _, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) { writeJSON(w, map[string]any{"content": rows}) })
+			n.token = "access"
+			i, err := n.Receipt(context.Background(), "chosen", 1000, date)
+			if mode != "active" && mode != "cancelled" {
+				if err == nil {
+					t.Fatal("unverified receipt accepted")
+				}
+				return
+			}
+			if err != nil || i.UUID() != "chosen" || i.Name != "Manual receipt title" || i.Cancelled() != (mode == "cancelled") {
+				t.Fatalf("bad receipt %+v %v", i, err)
+			}
+		})
+	}
+}
+func TestInspectIgnoresOnlySecurelyBoundOtherReceipt(t *testing.T) {
+	date := time.Date(2026, 10, 18, 10, 0, 0, 0, time.UTC)
+	for _, mode := range []string{"unknown marker", "known marker", "stale marker", "unknown manual", "known manual", "stale manual"} {
+		t.Run(mode, func(t *testing.T) {
+			title := "Service [yookassa:other]"
+			if strings.Contains(mode, "manual") {
+				title = "Earlier manual receipt"
+			}
+			n, store, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, map[string]any{"content": []map[string]any{{"approvedReceiptUuid": "other-receipt", "name": title, "totalAmount": "10.00", "operationTime": date.Format(time.RFC3339)}}})
+			})
+			n.token = "access"
+			if strings.HasPrefix(mode, "known") || strings.HasPrefix(mode, "stale") {
+				job := PaymentJob{ID: "other", Phase: "done", Receipt: "other-receipt", Amount: 1000, Remaining: 1000, Date: date, Description: "Service [yookassa:other]", Email: "other@example.com"}
+				binding := job
+				binding.Description = title
+				if strings.HasPrefix(mode, "stale") {
+					job.Receipt = "new-receipt"
+				}
+				records := []Record{paymentRecord(&job)}
+				if strings.Contains(mode, "manual") {
+					records = append(records, Record{Kind: "receipt_binding", ID: "other-receipt", Phase: "verified", Value: binding})
+				}
+				if err := store.Save(records...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id, conflict, err := n.Inspect(context.Background(), "Service [yookassa:chosen]", 1000, date)
+			wantConflict := !strings.HasPrefix(mode, "known")
+			if err != nil || id != "" || conflict != wantConflict {
+				t.Fatalf("id=%q conflict=%v want=%v err=%v", id, conflict, wantConflict, err)
+			}
+		})
 	}
 }

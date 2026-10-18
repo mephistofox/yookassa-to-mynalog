@@ -21,7 +21,7 @@ func (e *Engine) RetryPayment(ctx context.Context, id string, confirmedAbsent bo
 	if p.Phase == "done" {
 		return errors.New("payment already has a receipt")
 	}
-	if p.Error == "unsupported currency" || p.Error == "missing fxTunnel payment metadata" {
+	if p.Error == "unsupported currency" || p.Error == "missing fxTunnel payment metadata" || p.Error == "historical refund requires manual reconciliation" {
 		return errors.New("source validation failed; this record cannot be retried")
 	}
 	if !confirmedAbsent {
@@ -73,7 +73,7 @@ func (e *Engine) SetEmail(paymentID, email string) error {
 					belongs = found && r.PaymentID == p.ID
 				}
 			}
-			if belongs && d.Phase != "sent" && d.Phase != "superseded" {
+			if belongs && (d.Phase == "ready" || d.Phase == "blocked") {
 				d.Email = email
 				d.Phase = "ready"
 				d.Error = ""

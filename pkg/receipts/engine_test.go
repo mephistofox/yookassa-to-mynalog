@@ -226,7 +226,7 @@ func TestLostCreateResponseReconcilesAfterRestart(t *testing.T) {
 	f.e.Store = s
 	f.now = f.now.Add(time.Minute)
 	runOK(t, f, false)
-	if f.tax.created != 1 || f.tax.finds != 1 || len(f.sender.sent) != 1 {
+	if f.tax.created != 1 || f.tax.finds != 2 || len(f.sender.sent) != 1 {
 		t.Fatal("restart repeated financial write or lost outbox")
 	}
 	if getPayment(t, f.s, "one").Phase != "done" {

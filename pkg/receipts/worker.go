@@ -69,6 +69,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	retry := time.NewTicker(w.engine.Config.RetryInterval)
 	defer retry.Stop()
 	run := func(scan bool) {
+		if w.engine.Config.Manual {
+			return
+		}
 		cycle, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		if err := w.engine.Run(cycle, scan); err != nil && ctx.Err() == nil {
@@ -92,6 +95,9 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-retry.C:
 			run(false)
 		case <-w.wake:
+			if w.engine.Config.Manual {
+				continue
+			}
 			// The scanner intentionally leaves a 30-second settlement margin.
 			if delayed == nil {
 				delayed = time.NewTimer(35 * time.Second)

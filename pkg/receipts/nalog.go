@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,7 @@ func NewNalog(c Config, s StateStore) (*Nalog, error) {
 	return n, nil
 }
 func (n *Nalog) Authenticate(ctx context.Context) error {
+	n.token = ""
 	if time.Now().Before(n.authNext) {
 		return &APIError{Service: "nalog auth cooling down", Retryable: true}
 	}
@@ -78,7 +80,7 @@ func (n *Nalog) Authenticate(ctx context.Context) error {
 		n.authNext = time.Now().Add(time.Minute)
 		return err
 	}
-	if response.Profile.INN != "" && response.Profile.INN != n.config.INN {
+	if response.Profile.INN == "" || n.config.INN == "" || response.Profile.INN != n.config.INN {
 		n.authNext = time.Now().Add(5 * time.Minute)
 		return errors.New("nalog account INN does not match configured INN")
 	}
@@ -203,25 +205,52 @@ func (n *Nalog) incomes(ctx context.Context, date time.Time, visit func(Income) 
 	}
 	return errors.New("nalog income pagination limit")
 }
-func (n *Nalog) Find(ctx context.Context, name string, amount Money, date time.Time) (string, error) {
+
+// Inspect distinguishes exact payment markers from other same-day income.
+// A matching amount alone never identifies an existing receipt.
+func (n *Nalog) Inspect(ctx context.Context, name string, amount Money, date time.Time) (string, bool, error) {
 	var found string
+	conflict := false
+	moscow := time.FixedZone("Europe/Moscow", 3*60*60)
+	day := date.In(moscow).Format("2006-01-02")
 	err := n.incomes(ctx, date, func(i Income) error {
-		if i.Cancelled() || i.Name != name {
+		if i.Cancelled() {
+			return nil
+		}
+		if i.OperationTime.IsZero() {
+			return errors.New("nalog income date is missing")
+		}
+		if i.OperationTime.In(moscow).Format("2006-01-02") != day {
 			return nil
 		}
 		m, err := i.Money()
 		if err != nil {
 			return fmt.Errorf("nalog income amount invalid")
 		}
-		if m == amount && i.UUID() != "" {
+		if i.Name == name && m == amount && i.UUID() != "" {
 			if found != "" && found != i.UUID() {
 				return errors.New("multiple matching nalog receipts require manual review")
 			}
 			found = i.UUID()
+		} else if m == amount || i.Name == name {
+			known, err := n.knownOtherReceipt(i, m)
+			if err != nil {
+				return err
+			}
+			if !known {
+				conflict = true
+			}
 		}
 		return nil
 	})
-	return found, err
+	return found, conflict, err
+}
+func (n *Nalog) Find(ctx context.Context, name string, amount Money, date time.Time) (string, error) {
+	id, conflict, err := n.Inspect(ctx, name, amount, date)
+	if err == nil && conflict {
+		err = errors.New("other matching nalog income requires manual review")
+	}
+	return id, err
 }
 func (n *Nalog) Status(ctx context.Context, id string, date time.Time) (string, error) {
 	status := "missing"
@@ -235,4 +264,62 @@ func (n *Nalog) Status(ctx context.Context, id string, date time.Time) (string, 
 		return nil
 	})
 	return status, err
+}
+
+// Receipt verifies an explicitly selected document, including a manual title.
+// The caller must separately authorize the payment relationship and reject cancellation.
+func (n *Nalog) Receipt(ctx context.Context, id string, amount Money, date time.Time) (Income, error) {
+	var found Income
+	seen := false
+	moscow := time.FixedZone("Europe/Moscow", 3*60*60)
+	err := n.incomes(ctx, date, func(i Income) error {
+		if i.UUID() != id {
+			return nil
+		}
+		if seen {
+			return errors.New("multiple records for selected nalog receipt")
+		}
+		seen = true
+		m, err := i.Money()
+		if err != nil || m != amount || i.OperationTime.IsZero() || i.OperationTime.In(moscow).Format("2006-01-02") != date.In(moscow).Format("2006-01-02") || strings.TrimSpace(i.Name) == "" {
+			return errors.New("selected nalog receipt amount, date or title mismatch")
+		}
+		found = i
+		return nil
+	})
+	if err == nil && (!seen || id == "") {
+		err = errors.New("selected nalog receipt not found")
+	}
+	return found, err
+}
+func (n *Nalog) knownOtherReceipt(i Income, m Money) (bool, error) {
+	var bound PaymentJob
+	explicit, err := n.store.Get("receipt_binding", i.UUID(), &bound)
+	if err != nil {
+		return false, err
+	}
+	if !explicit {
+		marker := " [yookassa:"
+		pos := strings.LastIndex(i.Name, marker)
+		if pos < 0 || !strings.HasSuffix(i.Name, "]") {
+			return false, nil
+		}
+		bound.ID = i.Name[pos+len(marker) : len(i.Name)-1]
+		if bound.ID == "" || strings.ContainsAny(bound.ID, "[] \r\n") {
+			return false, nil
+		}
+	}
+	var actual PaymentJob
+	ok, err := n.store.Get("payment", bound.ID, &actual)
+	if err != nil {
+		return false, err
+	}
+	moscow := time.FixedZone("Europe/Moscow", 3*60*60)
+	if !ok || actual.ID != bound.ID || actual.Phase != "done" || actual.Receipt != i.UUID() || actual.Remaining != m || actual.Date.In(moscow).Format("2006-01-02") != i.OperationTime.In(moscow).Format("2006-01-02") {
+		return false, nil
+	}
+	if !explicit {
+		return actual.Description == i.Name, nil
+	}
+	return bound.Phase == "done" && bound.Receipt == actual.Receipt && bound.Amount == actual.Amount && bound.Remaining == actual.Remaining && bound.Date.Equal(actual.Date) && bound.Email == actual.Email && bound.Description == i.Name, nil
 }

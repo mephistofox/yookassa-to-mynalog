@@ -99,3 +99,16 @@ func (y *YooKassa) Refund(ctx context.Context, id string) (Refund, error) {
 	}
 	return r, err
 }
+
+// Payment fetches a single payment without enumerating shop history.
+func (y *YooKassa) Payment(ctx context.Context, id string) (Payment, error) {
+	var p Payment
+	if id == "" {
+		return p, errors.New("payment ID is required")
+	}
+	err := y.get(ctx, "/payments/"+url.PathEscape(id), nil, &p)
+	if err == nil && p.ID != id {
+		return p, errors.New("yookassa payment ID mismatch")
+	}
+	return p, err
+}

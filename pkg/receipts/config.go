@@ -20,6 +20,7 @@ type Config struct {
 	Start                                                         time.Time
 	PollInterval, RetryInterval, RequestTimeout, HealthMaxAge     time.Duration
 	RefundsEnabled                                                bool
+	Manual                                                        bool
 	FNSInterval                                                   time.Duration
 }
 
@@ -66,6 +67,10 @@ func LoadConfig() (Config, error) {
 	c.RefundsEnabled, e = strconv.ParseBool(get("REFUNDS_ENABLED", "false"))
 	if e != nil {
 		errs = append(errs, errors.New("invalid REFUNDS_ENABLED"))
+	}
+	c.Manual, e = strconv.ParseBool(get("MANUAL_MODE", "false"))
+	if e != nil {
+		errs = append(errs, errors.New("invalid MANUAL_MODE"))
 	}
 	s := get("SYNC_START_DATE", "")
 	c.Start, e = time.Parse(time.RFC3339, s)

@@ -57,7 +57,7 @@ func (e *Engine) Run(ctx context.Context, scan bool) error {
 			errs = append(errs, err)
 		}
 	}
-	if err := e.processPayments(ctx); err != nil {
+	if err := e.processPayments(ctx, ""); err != nil {
 		errs = append(errs, err)
 	}
 	if e.Config.RefundsEnabled {
@@ -72,7 +72,7 @@ func (e *Engine) Run(ctx context.Context, scan bool) error {
 			errs = append(errs, err)
 		}
 	}
-	if err := e.deliver(ctx); err != nil {
+	if err := e.deliver(ctx, ""); err != nil {
 		errs = append(errs, err)
 	}
 	if err := e.Store.SetMeta("worker.last", e.now().Format(time.RFC3339Nano)); err != nil {
@@ -119,60 +119,92 @@ func (e *Engine) scanPayments(ctx context.Context) error {
 		if p.CapturedAt.IsZero() || p.CapturedAt.Before(from) || p.CapturedAt.After(to) {
 			return errors.New("payment capture date outside requested window")
 		}
-		var old PaymentJob
-		exists, err := e.Store.Get("payment", p.ID, &old)
-		if err != nil || exists {
-			return err
-		}
-		amount, err := ParseMoney(p.Amount.Value)
-		if err != nil || amount <= 0 {
-			return errors.New("payment amount is invalid")
-		}
-		job := PaymentJob{ID: p.ID, Phase: "ready", Amount: amount, Remaining: amount, Date: p.CapturedAt, Description: e.Config.Description + " [yookassa:" + p.ID + "]", Email: p.Metadata["email"]}
-		if p.Amount.Currency != "RUB" {
-			job.Phase = "blocked"
-			job.Error = "unsupported currency"
-		}
-		// These keys are present on both fxTunnel checkout and renewal. A
-		// dedicated shop is still required; similar keys are not merchant identity.
-		for _, key := range []string{"invoice_id", "user_id", "subscription_id", "plan_id"} {
-			if p.Metadata[key] == "" {
-				job.Phase = "blocked"
-				job.Error = "missing fxTunnel payment metadata"
-			}
-		}
-		return e.Store.Save(paymentRecord(&job))
+		return e.ingestPayment(p)
 	})
 	if err != nil {
 		return err
 	}
 	return e.Store.SetMeta("checkpoint.payments", to.Format(time.RFC3339Nano))
 }
-func (e *Engine) processPayments(ctx context.Context) error {
+func paymentJob(p Payment, description string) (PaymentJob, error) {
+	amount, err := ParseMoney(p.Amount.Value)
+	if err != nil || amount <= 0 {
+		return PaymentJob{}, errors.New("payment amount is invalid")
+	}
+	job := PaymentJob{ID: p.ID, Phase: "ready", Amount: amount, Remaining: amount, Date: p.CapturedAt, Description: description + " [yookassa:" + p.ID + "]", Email: p.Metadata["email"]}
+	if p.Amount.Currency != "RUB" {
+		job.Phase = "blocked"
+		job.Error = "unsupported currency"
+	}
+	for _, key := range []string{"invoice_id", "user_id", "subscription_id", "plan_id"} {
+		if p.Metadata[key] == "" {
+			job.Phase = "blocked"
+			job.Error = "missing fxTunnel payment metadata"
+		}
+	}
+	if p.RefundedAmount.Value != "" || p.RefundedAmount.Currency != "" {
+		refunded, err := ParseMoney(p.RefundedAmount.Value)
+		if err != nil || p.RefundedAmount.Currency != "RUB" || refunded > 0 {
+			job.Phase = "blocked"
+			job.Error = "historical refund requires manual reconciliation"
+		}
+	}
+	return job, nil
+}
+func (e *Engine) ingestPayment(p Payment) error {
+	job, err := paymentJob(p, e.Config.Description)
+	if err != nil {
+		return err
+	}
+	var old PaymentJob
+	exists, err := e.Store.Get("payment", p.ID, &old)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if old.Amount != job.Amount || !old.Date.Equal(job.Date) || old.Description != job.Description || old.Email != job.Email {
+			return errors.New("payment source differs from persisted identity")
+		}
+		if job.Phase == "blocked" && old.Phase == "ready" {
+			old.Phase = job.Phase
+			old.Error = job.Error
+			return e.Store.Save(paymentRecord(&old))
+		}
+		return nil
+	}
+	return e.Store.Save(paymentRecord(&job))
+}
+func (e *Engine) processPayments(ctx context.Context, chosen string) error {
 	jobs, err := listAs[PaymentJob](e.Store, "payment")
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, p := range jobs {
+		if chosen != "" && p.ID != chosen {
+			continue
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if p.Phase != "ready" && p.Phase != "creating" && p.Phase != "uncertain" {
 			continue
 		}
-		if p.Next.After(e.now()) {
+		if p.Next.After(e.now()) && (chosen == "" || p.Phase == "ready") {
 			continue
 		}
 		p.Attempts++
 		var id string
 		var callErr error
 		if p.Phase == "ready" {
-			p.Phase = "creating"
-			if err = e.Store.Save(paymentRecord(&p)); err != nil {
-				return err
+			id, callErr = e.Tax.Find(ctx, p.Description, p.Amount, p.Date)
+			if callErr == nil && id == "" {
+				p.Phase = "creating"
+				if err = e.Store.Save(paymentRecord(&p)); err != nil {
+					return err
+				}
+				id, callErr = e.Tax.Create(ctx, p.Description, p.Amount, p.Date)
 			}
-			id, callErr = e.Tax.Create(ctx, p.Description, p.Amount, p.Date)
 		} else {
 			id, callErr = e.Tax.Find(ctx, p.Description, p.Amount, p.Date)
 			if callErr == nil && id == "" {
@@ -292,7 +324,7 @@ func (e *Engine) processRefunds(ctx context.Context) error {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("refund %s: %w", r.ID, err))
 		}
-		if r.Phase == "done" {
+		if err == nil && r.Phase == "done" {
 			busy[r.PaymentID] = false
 		}
 	}
@@ -354,7 +386,11 @@ func (e *Engine) processRefund(ctx context.Context, r *RefundJob) error {
 		r.Remaining = p.Remaining - r.Amount
 		r.Description = p.Description + " [refund:" + r.ID + "]"
 		r.Phase = "cancel_ready"
-		if err = e.Store.Save(refundRecord(r)); err != nil {
+		old, err := e.supersedeDeliveries(r.OldReceipt)
+		if err != nil {
+			return err
+		}
+		if err = e.Store.Save(append([]Record{refundRecord(r)}, old...)...); err != nil {
 			return err
 		}
 	}
@@ -426,55 +462,96 @@ func (e *Engine) processRefund(ctx context.Context, r *RefundJob) error {
 	}
 	return fail(errors.New("invalid refund phase"), "blocked")
 }
+func (e *Engine) supersedeDeliveries(receipt string) ([]Record, error) {
+	old, err := listAs[Delivery](e.Store, "delivery")
+	if err != nil {
+		return nil, err
+	}
+	var records []Record
+	for _, v := range old {
+		if v.Receipt == receipt && !v.Cancelled && v.Phase != "sent" && v.Phase != "superseded" {
+			v.Phase = "superseded"
+			v.Error = "receipt cancellation or replacement started"
+			records = append(records, deliveryRecord(&v))
+		}
+	}
+	return records, nil
+}
 func (e *Engine) completeRefund(r *RefundJob, p *PaymentJob, id string) error {
-	r.Phase = "done"
-	r.Error = ""
-	r.Next = time.Time{}
-	p.Remaining = r.Remaining
-	p.Receipt = id
-	records := []Record{refundRecord(r), paymentRecord(p)}
+	nextR, nextP := *r, *p
+	nextR.Phase = "done"
+	nextR.Error = ""
+	nextR.Next = time.Time{}
+	nextP.Remaining = r.Remaining
+	nextP.Receipt = id
 	d := e.delivery("refund:"+r.ID, id, p.Email, r.Remaining, id == "")
 	if id == "" {
 		d.Receipt = r.OldReceipt
 	}
-	records = append(records, deliveryRecord(&d))
-	// Do not deliver an obsolete receipt whose delivery has not happened yet.
-	old, err := listAs[Delivery](e.Store, "delivery")
+	old, err := e.supersedeDeliveries(r.OldReceipt)
 	if err != nil {
 		return err
 	}
-	for _, v := range old {
-		if v.Receipt == r.OldReceipt && v.Phase != "sent" && v.Phase != "superseded" {
-			v.Phase = "superseded"
-			v.Error = "receipt replaced or cancelled"
-			records = append(records, deliveryRecord(&v))
-		}
+	records := append([]Record{refundRecord(&nextR), paymentRecord(&nextP), deliveryRecord(&d)}, old...)
+	if err = e.Store.Save(records...); err != nil {
+		return err
 	}
-	return e.Store.Save(records...)
+	*r, *p = nextR, nextP
+	return nil
 }
-func (e *Engine) deliver(ctx context.Context) error {
+func (e *Engine) deliver(ctx context.Context, chosen string) error {
 	jobs, err := listAs[Delivery](e.Store, "delivery")
+	if err != nil {
+		return err
+	}
+	refunds, err := listAs[RefundJob](e.Store, "refund")
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, d := range jobs {
+		if chosen != "" && d.ID != chosen {
+			continue
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if d.Phase != "ready" || d.Next.After(e.now()) {
 			continue
 		}
+		obsolete := false
+		for _, r := range refunds {
+			if r.OldReceipt != "" && r.OldReceipt == d.Receipt && !d.Cancelled {
+				obsolete = true
+				break
+			}
+		}
+		if obsolete {
+			d.Phase = "superseded"
+			d.Error = "receipt cancellation or replacement started"
+			if err = e.Store.Save(deliveryRecord(&d)); err != nil {
+				return err
+			}
+			continue
+		}
 		if e.Config.DeliveryMode == "disabled" {
 			continue
 		}
 		d.Attempts++
+		d.Phase = "sending"
+		if err = e.Store.Save(deliveryRecord(&d)); err != nil {
+			return err
+		}
 		if e.Sender == nil {
 			err = errors.New("SMTP sender is unavailable")
 		} else {
 			err = e.Sender.Send(ctx, d)
 		}
 		if err != nil {
+			d.Phase = "ready"
+			if uncertain(err) {
+				d.Phase = "uncertain"
+			}
 			d.Error = "SMTP delivery failed"
 			d.Next = e.now().Add(backoff(d.Attempts))
 			errs = append(errs, fmt.Errorf("delivery %s failed", d.ID))
@@ -502,7 +579,11 @@ func (e *Engine) Health() (Health, error) {
 		return Health{}, err
 	}
 	h := Health{Ready: true, Counts: counts}
-	for _, key := range []string{"scan.payments.ok", "worker.last"} {
+	keys := []string{"scan.payments.ok", "worker.last"}
+	if e.Config.Manual {
+		keys = nil
+	}
+	for _, key := range keys {
 		v, err := e.Store.Meta(key)
 		if err != nil {
 			return h, err
@@ -512,7 +593,7 @@ func (e *Engine) Health() (Health, error) {
 			h.Issues = append(h.Issues, key+" stale")
 		}
 	}
-	if e.Config.RefundsEnabled {
+	if e.Config.RefundsEnabled && !e.Config.Manual {
 		v, err := e.Store.Meta("scan.refunds.ok")
 		if err != nil {
 			return h, err
@@ -523,7 +604,7 @@ func (e *Engine) Health() (Health, error) {
 		}
 	}
 	for key, n := range counts {
-		if n > 0 && (strings.HasSuffix(key, ".blocked") || strings.HasSuffix(key, ".uncertain") || strings.HasSuffix(key, ".creating") || strings.HasSuffix(key, ".replacing") || strings.HasSuffix(key, ".cancelling")) {
+		if n > 0 && (strings.HasSuffix(key, ".blocked") || strings.HasSuffix(key, ".uncertain") || strings.HasSuffix(key, ".creating") || strings.HasSuffix(key, ".replacing") || strings.HasSuffix(key, ".cancelling") || strings.HasSuffix(key, ".sending")) {
 			h.Issues = append(h.Issues, key+" requires attention")
 		}
 	}
@@ -564,4 +645,54 @@ func (e *Engine) Health() (Health, error) {
 	sort.Strings(h.Issues)
 	h.Ready = len(h.Issues) == 0
 	return h, nil
+}
+
+// ProcessPayment handles only the explicitly chosen payment and its original
+// delivery. The host must serialize it through Worker.Do and authorize its use.
+func (e *Engine) ProcessPayment(ctx context.Context, p Payment) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if p.ID == "" || p.Test || !p.Paid || p.Status != "succeeded" {
+		return errors.New("payment identity or confirmation is invalid")
+	}
+	if p.CapturedAt.IsZero() || p.CapturedAt.After(e.now()) || p.CapturedAt.Before(e.Config.Start) {
+		return errors.New("payment capture date is invalid")
+	}
+	job, err := paymentJob(p, e.Config.Description)
+	if err != nil {
+		return err
+	}
+	if job.Phase == "blocked" {
+		return errors.New(job.Error)
+	}
+	if !validEmail(job.Email) {
+		return errors.New("missing or invalid customer email")
+	}
+	if err = e.ingestPayment(p); err != nil {
+		return err
+	}
+	if err = e.processPayments(ctx, p.ID); err != nil {
+		return err
+	}
+	var current PaymentJob
+	ok, err := e.Store.Get("payment", p.ID, &current)
+	if err != nil {
+		return err
+	}
+	if !ok || current.Phase != "done" {
+		return errors.New("payment is held for reconciliation")
+	}
+	if err = e.deliver(ctx, p.ID); err != nil {
+		return err
+	}
+	var delivery Delivery
+	ok, err = e.Store.Get("delivery", p.ID, &delivery)
+	if err != nil {
+		return err
+	}
+	if !ok || delivery.Phase != "sent" {
+		return errors.New("payment delivery is held for reconciliation")
+	}
+	return nil
 }

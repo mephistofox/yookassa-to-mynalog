@@ -48,15 +48,16 @@ type Amount struct {
 	Currency string `json:"currency"`
 }
 type Payment struct {
-	ID          string            `json:"id"`
-	Status      string            `json:"status"`
-	Paid        bool              `json:"paid"`
-	Test        bool              `json:"test"`
-	Amount      Amount            `json:"amount"`
-	CapturedAt  time.Time         `json:"captured_at"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Description string            `json:"description"`
-	Metadata    map[string]string `json:"metadata"`
+	ID             string            `json:"id"`
+	Status         string            `json:"status"`
+	Paid           bool              `json:"paid"`
+	Test           bool              `json:"test"`
+	Amount         Amount            `json:"amount"`
+	RefundedAmount Amount            `json:"refunded_amount"`
+	CapturedAt     time.Time         `json:"captured_at"`
+	CreatedAt      time.Time         `json:"created_at"`
+	Description    string            `json:"description"`
+	Metadata       map[string]string `json:"metadata"`
 }
 type Refund struct {
 	ID        string    `json:"id"`
@@ -106,11 +107,12 @@ type Delivery struct {
 }
 
 type Income struct {
-	Name         string          `json:"name"`
-	ID           string          `json:"approvedReceiptUuid"`
-	ReceiptID    string          `json:"receiptUuid"`
-	Total        json.RawMessage `json:"totalAmount"`
-	Cancellation json.RawMessage `json:"cancellationInfo"`
+	Name          string          `json:"name"`
+	OperationTime time.Time       `json:"operationTime"`
+	ID            string          `json:"approvedReceiptUuid"`
+	ReceiptID     string          `json:"receiptUuid"`
+	Total         json.RawMessage `json:"totalAmount"`
+	Cancellation  json.RawMessage `json:"cancellationInfo"`
 }
 
 func (i Income) UUID() string {
