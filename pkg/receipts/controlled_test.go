@@ -136,7 +136,9 @@ func TestMissingINNFailsClosedIncludingAfterPreviousAuthentication(t *testing.T)
 					writeJSON(w, map[string]any{"token": "access", "profile": map[string]string{"inn": identity}})
 					return
 				}
-				posts++
+				if r.URL.Path == "/income" {
+					posts++
+				}
 				writeJSON(w, map[string]string{"approvedReceiptUuid": "receipt"})
 			})
 			if err := n.Authenticate(context.Background()); err != nil {

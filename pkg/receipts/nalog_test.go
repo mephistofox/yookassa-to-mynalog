@@ -298,3 +298,281 @@ func TestInspectIgnoresOnlySecurelyBoundOtherReceipt(t *testing.T) {
 		})
 	}
 }
+
+func TestNalogAuthWithoutEmbeddedProfileVerifiesAuthenticatedUserBeforeIncome(t *testing.T) {
+	auths, profiles, posts := 0, 0, 0
+	n, _, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/token":
+			auths++
+			writeJSON(w, map[string]any{"token": "unverified-access", "tokenExpireIn": 3600, "refreshToken": "new-refresh", "refreshTokenExpiresIn": 86400})
+		case "/user":
+			profiles++
+			if r.Method != "GET" || r.Header.Get("Authorization") != "Bearer unverified-access" {
+				t.Error("identity probe did not use new bearer token")
+			}
+			writeJSON(w, map[string]string{"inn": "123456789012"})
+		case "/income":
+			posts++
+			if profiles != 1 {
+				t.Error("income preceded identity proof")
+			}
+			writeJSON(w, map[string]string{"approvedReceiptUuid": "verified-receipt"})
+		default:
+			t.Error("unexpected endpoint")
+			w.WriteHeader(404)
+		}
+	})
+	id, err := n.Create(context.Background(), "payment", 100, time.Now())
+	if err != nil || id != "verified-receipt" || auths != 1 || profiles != 1 || posts != 1 {
+		t.Fatalf("identity fallback failed auth=%d profiles=%d posts=%d err=%v", auths, profiles, posts, err)
+	}
+}
+func TestNalogProfileFallbackFailsClosedWithoutRecursiveAuthentication(t *testing.T) {
+	for _, mode := range []string{"unauthorized", "unavailable", "missing", "wrong", "malformed"} {
+		t.Run(mode, func(t *testing.T) {
+			auths, profiles, posts := 0, 0, 0
+			n, _, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/auth/token":
+					auths++
+					writeJSON(w, map[string]string{"token": "candidate", "refreshToken": "rotated"})
+				case "/user":
+					profiles++
+					switch mode {
+					case "unauthorized":
+						w.WriteHeader(401)
+					case "unavailable":
+						w.WriteHeader(503)
+					case "missing":
+						writeJSON(w, map[string]string{})
+					case "wrong":
+						writeJSON(w, map[string]string{"inn": "999999999999"})
+					case "malformed":
+						writeJSON(w, map[string]int{"inn": 123})
+					}
+				case "/income":
+					posts++
+					writeJSON(w, map[string]string{"approvedReceiptUuid": "must-not-exist"})
+				}
+			})
+			if _, err := n.Create(context.Background(), "payment", 100, time.Now()); err == nil || uncertain(err) {
+				t.Fatalf("identity failure accepted/misclassified: %v", err)
+			}
+			if auths != 1 || profiles != 1 || posts != 0 || n.token != "" {
+				t.Fatalf("unsafe fallback auth=%d profile=%d financial=%d", auths, profiles, posts)
+			}
+		})
+	}
+}
+func TestNalogPendingRefreshSurvivesProbeFailureAndRequiresIdentityOnRestart(t *testing.T) {
+	profileOK := false
+	auths, posts := 0, 0
+	n, s, server := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/token":
+			var payload map[string]any
+			if json.NewDecoder(r.Body).Decode(&payload) != nil {
+				t.Error("invalid auth payload")
+			}
+			want := "seed-secret"
+			if auths > 0 {
+				want = "pending-refresh"
+			}
+			if payload["refreshToken"] != want {
+				t.Error("rotated credential was lost")
+			}
+			auths++
+			writeJSON(w, map[string]string{"token": "candidate", "refreshToken": "pending-refresh"})
+		case "/user":
+			if !profileOK {
+				w.WriteHeader(503)
+				return
+			}
+			writeJSON(w, map[string]string{"inn": "123456789012"})
+		case "/income":
+			posts++
+			writeJSON(w, map[string]string{"approvedReceiptUuid": "receipt"})
+		}
+	})
+	if err := n.Authenticate(context.Background()); err == nil || n.token != "" {
+		t.Fatal("failed identity probe accepted access token")
+	}
+	raw, err := s.Meta("auth.refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var staged map[string]string
+	if json.Unmarshal([]byte(raw), &staged) != nil || staged["PendingToken"] != "pending-refresh" || staged["Token"] != "" {
+		t.Fatal("unverified rotation was not staged separately")
+	}
+	restarted, err := NewNalog(n.config, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.base = server.URL
+	restarted.client = server.Client()
+	profileOK = true
+	if _, err = restarted.Create(context.Background(), "payment", 100, time.Now()); err != nil || posts != 1 {
+		t.Fatal("restart could not verify pending rotation", err)
+	}
+	raw, err = s.Meta("auth.refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json.Unmarshal([]byte(raw), &staged) != nil || staged["Token"] != "pending-refresh" || staged["PendingToken"] != "" {
+		t.Fatal("verified rotation was not promoted")
+	}
+	for _, field := range []string{"seed", "device"} {
+		c := n.config
+		if field == "seed" {
+			c.RefreshToken = "new-seed"
+		} else {
+			c.DeviceID = "other-device"
+		}
+		other, err := NewNalog(c, s)
+		if err != nil || other.refresh != c.RefreshToken {
+			t.Fatal("pending credential crossed seed/device binding")
+		}
+	}
+}
+func TestNalogWrongProfileNeverPromotesPendingCredential(t *testing.T) {
+	identity := "123456789012"
+	rotation := "verified-refresh"
+	n, s, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth/token":
+			writeJSON(w, map[string]string{"token": "candidate", "refreshToken": rotation})
+		case "/user":
+			writeJSON(w, map[string]string{"inn": identity})
+		}
+	})
+	if err := n.Authenticate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	identity = "999999999999"
+	rotation = "wrong-account-refresh"
+	if err := n.Authenticate(context.Background()); err == nil || n.token != "" {
+		t.Fatal("wrong account accepted")
+	}
+	raw, err := s.Meta("auth.refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]string
+	json.Unmarshal([]byte(raw), &saved)
+	if saved["Token"] != "verified-refresh" || saved["PendingToken"] != "" {
+		t.Fatal("wrong-account rotation poisoned verified credential")
+	}
+}
+
+type failRefreshSave struct {
+	StateStore
+	calls, failAt int
+}
+
+func (s *failRefreshSave) SetMeta(k, v string) error {
+	if k == "auth.refresh" {
+		s.calls++
+		if s.calls == s.failAt {
+			return errors.New("injected credential commit failure")
+		}
+	}
+	return s.StateStore.SetMeta(k, v)
+}
+func TestNalogPendingRefreshPersistenceFailureBlocksFinancialWrite(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprint(failAt), func(t *testing.T) {
+			profiles, posts := 0, 0
+			n, s, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/auth/token":
+					writeJSON(w, map[string]string{"token": "candidate", "refreshToken": "rotation"})
+				case "/user":
+					profiles++
+					writeJSON(w, map[string]string{"inn": "123456789012"})
+				case "/income":
+					posts++
+					writeJSON(w, map[string]string{"approvedReceiptUuid": "bad"})
+				}
+			})
+			n.store = &failRefreshSave{StateStore: s, failAt: failAt}
+			if _, err := n.Create(context.Background(), "payment", 100, time.Now()); err == nil || posts != 0 || n.token != "" {
+				t.Fatal("credential durability failure allowed income")
+			}
+			if failAt == 1 && profiles != 0 {
+				t.Fatal("used undurable candidate for identity probe")
+			}
+		})
+	}
+}
+func TestNalogEmbeddedWrongIdentityDiscardsPreviouslyPendingRotation(t *testing.T) {
+	embedded := false
+	n, s, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/token" {
+			response := map[string]any{"token": "candidate", "refreshToken": "pending"}
+			if embedded {
+				response["profile"] = map[string]string{"inn": "999999999999"}
+			}
+			writeJSON(w, response)
+			return
+		}
+		w.WriteHeader(503)
+	})
+	if err := n.Authenticate(context.Background()); err == nil {
+		t.Fatal("expected profile failure")
+	}
+	n.authNext = time.Time{}
+	embedded = true
+	if err := n.Authenticate(context.Background()); err == nil {
+		t.Fatal("wrong inline identity accepted")
+	}
+	raw, err := s.Meta("auth.refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]string
+	json.Unmarshal([]byte(raw), &saved)
+	if saved["PendingToken"] != "" {
+		t.Fatal("known wrong-account pending credential retained")
+	}
+}
+func TestNalogVerifiedCredentialPromotionClearsStalePendingCandidate(t *testing.T) {
+	step := 0
+	n, s, _ := testNalog(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/token" {
+			candidate := "verified"
+			if step == 1 {
+				candidate = "pending"
+			}
+			writeJSON(w, map[string]string{"token": "access", "refreshToken": candidate})
+			return
+		}
+		if step == 1 {
+			w.WriteHeader(503)
+			return
+		}
+		writeJSON(w, map[string]string{"inn": "123456789012"})
+	})
+	if err := n.Authenticate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	step = 1
+	if err := n.Authenticate(context.Background()); err == nil {
+		t.Fatal("expected profile failure")
+	}
+	n.authNext = time.Time{}
+	step = 2
+	if err := n.Authenticate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.Meta("auth.refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]string
+	json.Unmarshal([]byte(raw), &saved)
+	if saved["PendingToken"] != "" || saved["Token"] != "verified" || n.refresh != "verified" {
+		t.Fatal("stale pending credential survived successful identity proof")
+	}
+}

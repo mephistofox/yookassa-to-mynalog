@@ -17,15 +17,17 @@ import (
 )
 
 type Nalog struct {
-	client         *http.Client
-	base           string
-	config         Config
-	store          StateStore
-	token, refresh string
-	authNext       time.Time
-	lastRequest    time.Time
+	client          *http.Client
+	base            string
+	config          Config
+	store           StateStore
+	token, refresh  string
+	verifiedRefresh string
+	pendingRefresh  string
+	authNext        time.Time
+	lastRequest     time.Time
 }
-type tokenState struct{ Device, SeedHash, Token string }
+type tokenState struct{ Device, SeedHash, Token, PendingToken string }
 
 func seedHash(s string) string { b := sha256.Sum256([]byte(s)); return hex.EncodeToString(b[:]) }
 func NewNalog(c Config, s StateStore) (*Nalog, error) {
@@ -39,8 +41,14 @@ func NewNalog(c Config, s StateStore) (*Nalog, error) {
 		if err = json.Unmarshal([]byte(v), &saved); err != nil {
 			return nil, errors.New("corrupt saved refresh token")
 		}
-		if saved.Device == c.DeviceID && saved.SeedHash == seedHash(c.RefreshToken) && saved.Token != "" {
-			n.refresh = saved.Token
+		if saved.Device == c.DeviceID && saved.SeedHash == seedHash(c.RefreshToken) {
+			n.verifiedRefresh = saved.Token
+			n.pendingRefresh = saved.PendingToken
+			if saved.PendingToken != "" {
+				n.refresh = saved.PendingToken
+			} else if saved.Token != "" {
+				n.refresh = saved.Token
+			}
 		}
 	}
 	return n, nil
@@ -80,25 +88,99 @@ func (n *Nalog) Authenticate(ctx context.Context) error {
 		n.authNext = time.Now().Add(time.Minute)
 		return err
 	}
-	if response.Profile.INN == "" || n.config.INN == "" || response.Profile.INN != n.config.INN {
+	if n.config.INN == "" || (response.Profile.INN != "" && response.Profile.INN != n.config.INN) {
+		if n.pendingRefresh != "" {
+			if err = n.saveRefresh(n.verifiedRefresh, ""); err != nil {
+				return err
+			}
+		}
 		n.authNext = time.Now().Add(5 * time.Minute)
 		return errors.New("nalog account INN does not match configured INN")
 	}
-	if response.Refresh != "" && response.Refresh != n.refresh {
-		b, _ := json.Marshal(tokenState{n.config.DeviceID, seedHash(n.config.RefreshToken), response.Refresh})
-		// Fail closed if a rotated credential cannot be persisted durably.
-		if err = n.store.SetMeta("auth.refresh", string(b)); err != nil {
-			return errors.New("cannot persist rotated refresh token")
+	candidate := n.refresh
+	if response.Refresh != "" {
+		candidate = response.Refresh
+	}
+	// Keep rotation recoverable without promoting an account whose identity is unverified.
+	if response.Profile.INN == "" || response.Token == "" {
+		if candidate != n.verifiedRefresh {
+			if err = n.saveRefresh(n.verifiedRefresh, candidate); err != nil {
+				return err
+			}
 		}
-		n.refresh = response.Refresh
 	}
 	if response.Token == "" {
 		return &APIError{Service: "nalog auth", Status: 200, Retryable: true}
+	}
+	identity := response.Profile.INN
+	if identity == "" {
+		identity, err = n.userINN(ctx, response.Token)
+		if err != nil {
+			n.authNext = time.Now().Add(time.Minute)
+			return err
+		}
+		if identity == "" {
+			n.authNext = time.Now().Add(time.Minute)
+			return errors.New("nalog user profile lacks taxpayer INN")
+		}
+		if identity != n.config.INN {
+			if err = n.saveRefresh(n.verifiedRefresh, ""); err != nil {
+				return err
+			}
+			n.authNext = time.Now().Add(5 * time.Minute)
+			return errors.New("nalog account INN does not match configured INN")
+		}
+	}
+	// A failed promotion never grants access, even after successful identity verification.
+	if candidate != n.verifiedRefresh || n.pendingRefresh != "" {
+		if err = n.saveRefresh(candidate, ""); err != nil {
+			return err
+		}
 	}
 	n.token = response.Token
 	n.authNext = time.Time{}
 	return nil
 }
+func (n *Nalog) saveRefresh(verified, pending string) error {
+	b, err := json.Marshal(tokenState{Device: n.config.DeviceID, SeedHash: seedHash(n.config.RefreshToken), Token: verified, PendingToken: pending})
+	if err != nil {
+		return errors.New("cannot encode rotated refresh token")
+	}
+	if err = n.store.SetMeta("auth.refresh", string(b)); err != nil {
+		return errors.New("cannot persist rotated refresh token")
+	}
+	n.verifiedRefresh = verified
+	n.pendingRefresh = pending
+	n.refresh = pending
+	if n.refresh == "" {
+		n.refresh = verified
+	}
+	if n.refresh == "" {
+		n.refresh = n.config.RefreshToken
+	}
+	return nil
+}
+func (n *Nalog) userINN(ctx context.Context, access string) (string, error) {
+	if err := n.pace(ctx); err != nil {
+		return "", &APIError{Service: "nalog profile pacing cancelled", Retryable: true}
+	}
+	r, err := jsonRequest(ctx, http.MethodGet, n.base+"/user", nil)
+	if err != nil {
+		return "", err
+	}
+	r.Header.Set("Authorization", "Bearer "+access)
+	r.Header.Set("Origin", "https://lknpd.nalog.ru")
+	r.Header.Set("Referer", "https://lknpd.nalog.ru/")
+	var profile struct {
+		INN string `json:"inn"`
+	}
+	// This probe must not call request: a 401 must not recurse into Authenticate.
+	if err = execute(n.client, r, "nalog profile", false, &profile); err != nil {
+		return "", err
+	}
+	return profile.INN, nil
+}
+
 func (n *Nalog) request(ctx context.Context, method, path string, value any, write bool, out any) error {
 	if n.token == "" {
 		if err := n.Authenticate(ctx); err != nil {
